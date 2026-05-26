@@ -44,6 +44,10 @@ class MotorClasico:
         ranking_ordenado = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return ranking_ordenado[:top_k]
 
+    def buscar_booleano(self, consulta, top_k=10):
+        """Alias de compatibilidad para búsqueda booleana basada en Jaccard."""
+        return self.buscar_jaccard(consulta, top_k=top_k)
+
     # ---------------------------------------------------------
     # MODELO 2: SIMILITUD DE COSENO (TF-IDF)
     # ---------------------------------------------------------
