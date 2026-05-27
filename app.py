@@ -33,6 +33,13 @@ MODEL_LABELS = {
     "Jaccard": "buscar_jaccard",
 }
 
+MODEL_COLORS = {
+    "TF-IDF + Coseno": "#2563eb",
+    "BM25": "#dc2626",
+    "Jaccard": "#d97706",
+    "Semántico": "#059669",
+}
+
 
 st.set_page_config(
     page_title="Motor de Búsqueda Reuters-21578",
@@ -57,22 +64,85 @@ st.markdown(
             color: #5b6573;
             margin-bottom: 1rem;
         }
-            .hit-snippet {
-                padding: 0.85rem 1rem;
-                border-left: 4px solid #ffb300;
-                background: #fff8e7;
-                border-radius: 10px;
-                white-space: pre-wrap;
-                line-height: 1.55;
-                font-size: 0.95rem;
-            }
-            .model-winner {
-                padding: 0.75rem 1rem;
-                background: #eef7ff;
-                border: 1px solid #b9dcff;
-                border-radius: 10px;
-                margin-bottom: 0.75rem;
-            }
+        .hit-snippet {
+            padding: 0.85rem 1rem;
+            border-left: 4px solid #ffb300;
+            background: #fff8e7;
+            color: #111827;
+            border-radius: 10px;
+            white-space: pre-wrap;
+            line-height: 1.55;
+            font-size: 0.95rem;
+        }
+        .hit-snippet mark {
+            background: #fde68a;
+            color: #111827;
+            border-radius: 4px;
+            padding: 0 0.15rem;
+        }
+        .doc-body {
+            padding: 1rem;
+            border: 1px solid #dbe3ef;
+            border-radius: 10px;
+            background: #f8fafc;
+            color: #0f172a;
+            line-height: 1.65;
+            white-space: pre-wrap;
+            font-size: 0.96rem;
+        }
+        .model-winner {
+            padding: 0.75rem 1rem;
+            background: #eef7ff;
+            border: 1px solid #b9dcff;
+            border-radius: 10px;
+            margin-bottom: 0.75rem;
+            color: #0f172a;
+        }
+        .model-winner * {
+            color: #0f172a !important;
+        }
+        .model-card {
+            border: 1px solid #d7deea;
+            border-left: 7px solid var(--model-color);
+            border-radius: 12px;
+            padding: 0.85rem 0.95rem;
+            background: #ffffff;
+            color: #0f172a;
+            margin-bottom: 0.75rem;
+        }
+        .model-card-title {
+            font-weight: 700;
+            margin-bottom: 0.25rem;
+        }
+        .model-chip {
+            display: inline-block;
+            width: 11px;
+            height: 11px;
+            border-radius: 999px;
+            background: var(--model-color);
+            margin-right: 0.4rem;
+            transform: translateY(1px);
+        }
+        .score-bar-row {
+            margin-bottom: 0.62rem;
+        }
+        .score-bar-label {
+            font-size: 0.9rem;
+            color: #334155;
+            margin-bottom: 0.2rem;
+        }
+        .score-bar-track {
+            width: 100%;
+            height: 11px;
+            border-radius: 999px;
+            background: #e8edf5;
+            overflow: hidden;
+        }
+        .score-bar-fill {
+            height: 100%;
+            border-radius: 999px;
+            background: var(--model-color);
+        }
     </style>
     """,
     unsafe_allow_html=True,
@@ -216,7 +286,7 @@ def _resaltar_fragmento(texto, consulta, ventana=220):
 
 
 def _comparar_modelos(motor_clasico, motor_semantico, consulta, top_k):
-    """Ejecuta todos los modelos disponibles y normaliza sus scores top para comparar la consulta."""
+    """Ejecuta modelos y devuelve score crudo y normalizado de forma estable y legible."""
     modelos = ["TF-IDF + Coseno", "BM25", "Jaccard"]
     if motor_semantico is not None:
         modelos.append("Semántico")
@@ -254,10 +324,141 @@ def _comparar_modelos(motor_clasico, motor_semantico, consulta, top_k):
         if maximo > minimo:
             df["score_normalizado"] = (df["score_top1"] - minimo) / (maximo - minimo)
         else:
-            df["score_normalizado"] = 1.0
-        df = df.sort_values(["score_normalizado", "score_top1"], ascending=False).reset_index(drop=True)
+            df["score_normalizado"] = 0.5
+
+        df["score_normalizado_pct"] = (df["score_normalizado"] * 100).round(1)
+        df["color"] = df["modelo"].map(MODEL_COLORS).fillna("#64748b")
+        df["rank_normalizado"] = (
+            df["score_normalizado"]
+            .rank(ascending=False, method="min")
+            .astype(int)
+        )
+
+        orden_modelos = ["TF-IDF + Coseno", "BM25", "Jaccard", "Semántico"]
+        df["_orden"] = df["modelo"].apply(lambda x: orden_modelos.index(x) if x in orden_modelos else 99)
+        df = df.sort_values("_orden").drop(columns=["_orden"]).reset_index(drop=True)
 
     return df, resultados_por_modelo
+
+
+def _render_score_bars(df, valor_columna, titulo, maximo, sufijo=""):
+    st.caption(titulo)
+    for _, fila in df.iterrows():
+        modelo = str(fila["modelo"])
+        color = fila.get("color", "#64748b")
+        valor = float(fila[valor_columna])
+        ancho = 0.0 if maximo <= 0 else (valor / maximo) * 100
+        ancho = max(0.0, min(100.0, ancho))
+        st.markdown(
+            (
+                '<div class="score-bar-row" style="--model-color: {color}">'
+                '<div class="score-bar-label"><span class="model-chip"></span>{modelo}: <strong>{valor:.4f}{sufijo}</strong></div>'
+                '<div class="score-bar-track"><div class="score-bar-fill" style="width: {ancho:.2f}%"></div></div>'
+                "</div>"
+            ).format(
+                color=color,
+                modelo=html.escape(modelo),
+                valor=valor,
+                sufijo=sufijo,
+                ancho=ancho,
+            ),
+            unsafe_allow_html=True,
+        )
+
+
+def _render_model_cards(df):
+    for _, fila in df.iterrows():
+        modelo = str(fila["modelo"])
+        color = fila.get("color", "#64748b")
+        st.markdown(
+            (
+                '<div class="model-card" style="--model-color: {color}">'
+                '<div class="model-card-title"><span class="model-chip"></span>{modelo}</div>'
+                "Top 1: <strong>{doc}</strong><br>"
+                "Score crudo: <strong>{crudo:.4f}</strong><br>"
+                "Score normalizado: <strong>{norm:.1f}/100</strong><br>"
+                "Recuperados: <strong>{rec}</strong> | Ranking normalizado: <strong>#{rank}</strong>"
+                "</div>"
+            ).format(
+                color=color,
+                modelo=html.escape(modelo),
+                doc=html.escape(str(fila["doc_id_top1"])),
+                crudo=float(fila["score_top1"]),
+                norm=float(fila["score_normalizado_pct"]),
+                rec=int(fila["docs_recuperados"]),
+                rank=int(fila["rank_normalizado"]),
+            ),
+            unsafe_allow_html=True,
+        )
+
+
+def _render_grafico_final_comparativo(resultados_por_modelo):
+    """Dibuja un solo gráfico con todos los modelos para comparar en el mismo plano."""
+    filas = []
+    orden = ["TF-IDF + Coseno", "BM25", "Jaccard", "Semántico"]
+
+    for modelo in orden:
+        lista_resultados = resultados_por_modelo.get(modelo, [])
+        if not lista_resultados:
+            continue
+
+        max_modelo = max(float(score) for _, score in lista_resultados)
+        max_modelo = max(max_modelo, 1e-12)
+
+        for rank, (_, score) in enumerate(lista_resultados, 1):
+            score_crudo = float(score)
+            score_norm_0_100 = (score_crudo / max_modelo) * 100
+            filas.append(
+                {
+                    "modelo": modelo,
+                    "rank": rank,
+                    "score_crudo": score_crudo,
+                    "score_norm_0_100": score_norm_0_100,
+                }
+            )
+
+    if not filas:
+        st.caption("No hay datos suficientes para el gráfico comparativo final.")
+        return
+
+    df_chart = pd.DataFrame(filas)
+    st.markdown("#### Gráfico final comparativo (todos los modelos en uno)")
+    st.caption("Comparación por ranking usando score normalizado dentro de cada modelo (0-100).")
+
+    escala_colores = [
+        MODEL_COLORS["TF-IDF + Coseno"],
+        MODEL_COLORS["BM25"],
+        MODEL_COLORS["Jaccard"],
+        MODEL_COLORS["Semántico"],
+    ]
+
+    st.vega_lite_chart(
+        df_chart,
+        {
+            "mark": {"type": "line", "point": True, "strokeWidth": 3},
+            "encoding": {
+                "x": {"field": "rank", "type": "ordinal", "title": "Ranking (Top K)"},
+                "y": {"field": "score_norm_0_100", "type": "quantitative", "title": "Score normalizado (0-100)", "scale": {"domain": [0, 100]}},
+                "color": {
+                    "field": "modelo",
+                    "type": "nominal",
+                    "scale": {
+                        "domain": ["TF-IDF + Coseno", "BM25", "Jaccard", "Semántico"],
+                        "range": escala_colores,
+                    },
+                    "legend": {"title": "Modelo"},
+                },
+                "tooltip": [
+                    {"field": "modelo", "type": "nominal", "title": "Modelo"},
+                    {"field": "rank", "type": "ordinal", "title": "Rank"},
+                    {"field": "score_crudo", "type": "quantitative", "title": "Score crudo", "format": ".4f"},
+                    {"field": "score_norm_0_100", "type": "quantitative", "title": "Score norm", "format": ".1f"},
+                ],
+            },
+            "height": 320,
+        },
+        use_container_width=True,
+    )
 
 
 def _normalizar_relevantes(valor):
@@ -431,26 +632,56 @@ if seccion == "Buscar":
 
             if comparar_modelos and comparacion_df is not None and not comparacion_df.empty:
                 st.markdown("### Comparación de modelos para la misma consulta")
-                mejor_fila = comparacion_df.iloc[0]
+                mejor_fila = comparacion_df.sort_values(["score_normalizado", "score_top1"], ascending=False).iloc[0]
                 st.markdown(
                     f'<div class="model-winner"><strong>Mejor modelo para esta consulta:</strong> {mejor_fila["modelo"]} '
                     f'| Documento top1: {mejor_fila["doc_id_top1"]} '
-                    f'| Score normalizado: {mejor_fila["score_normalizado"]:.4f}</div>',
+                    f'| Score normalizado: {mejor_fila["score_normalizado_pct"]:.1f}/100</div>',
                     unsafe_allow_html=True,
                 )
+
+                st.markdown("#### Resumen visual por modelo")
+                _render_model_cards(comparacion_df)
+
                 st.dataframe(
-                    comparacion_df[["modelo", "doc_id_top1", "score_top1", "score_normalizado", "docs_recuperados"]],
+                    comparacion_df[
+                        [
+                            "modelo",
+                            "doc_id_top1",
+                            "score_top1",
+                            "score_normalizado_pct",
+                            "docs_recuperados",
+                            "rank_normalizado",
+                        ]
+                    ].rename(
+                        columns={
+                            "score_top1": "score_crudo_top1",
+                            "score_normalizado_pct": "score_normalizado_0_100",
+                            "rank_normalizado": "ranking_norm",
+                        }
+                    ),
                     use_container_width=True,
                     hide_index=True,
                 )
 
                 grafico_comp_col1, grafico_comp_col2 = st.columns(2)
                 with grafico_comp_col1:
-                    st.caption("Score top1 normalizado por modelo")
-                    st.bar_chart(comparacion_df.set_index("modelo")["score_normalizado"])
+                    _render_score_bars(
+                        comparacion_df,
+                        "score_normalizado_pct",
+                        "Score top1 normalizado por modelo (0-100)",
+                        maximo=100.0,
+                        sufijo="",
+                    )
                 with grafico_comp_col2:
-                    st.caption("Score top1 crudo por modelo")
-                    st.bar_chart(comparacion_df.set_index("modelo")["score_top1"])
+                    max_crudo = float(comparacion_df["score_top1"].max()) if not comparacion_df.empty else 0.0
+                    _render_score_bars(
+                        comparacion_df,
+                        "score_top1",
+                        "Score top1 crudo por modelo",
+                        maximo=max_crudo,
+                        sufijo="",
+                    )
 
                 if resultados_comparados:
                     with st.expander("Ver resultados de cada modelo"):
@@ -470,6 +701,8 @@ if seccion == "Buscar":
                                 ]
                             )
                             st.dataframe(mini_df, use_container_width=True, hide_index=True)
+
+                    _render_grafico_final_comparativo(resultados_comparados)
         else:
             st.warning("No se encontraron documentos relevantes.")
 
@@ -488,7 +721,7 @@ elif seccion == "Documento":
                 st.markdown(f"### {titulo}")
                 st.write(f"**ID:** {doc_id}")
                 st.write(f"**Topics:** {', '.join(metadata_topics.get(str(doc_id), [])) or 'Sin topics'}")
-                st.code(cuerpo, language="text")
+                st.markdown(f'<div class="doc-body">{html.escape(cuerpo)}</div>', unsafe_allow_html=True)
 
 elif seccion == "Modelos":
     st.subheader("Modelos disponibles")

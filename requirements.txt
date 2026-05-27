@@ -15,5 +15,5 @@ python-dotenv>=0.19.0
 numpy>=1.21.0
 
 # Adicionales (opcional)
-ipython>=7.0.0
-jupyter>=1.0.0
+#ipython>=7.0.0
+#jupyter>=1.0.0
