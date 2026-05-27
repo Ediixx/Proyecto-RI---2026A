@@ -1,5 +1,8 @@
 import json
+import html
 import os
+import pickle
+import re
 
 import pandas as pd
 import streamlit as st
@@ -17,6 +20,12 @@ except Exception:
 RUTA_INDICE = "db/indice_invertido.pkl"
 RUTA_DATA = "data"
 RUTA_QRELS = "data/qrels.json"
+RUTA_CACHE_CORPUS = "db/corpus_cache.pkl"
+
+ARCHIVOS_CORPUS = [
+    os.path.join(RUTA_DATA, "ModApte_train.csv"),
+    os.path.join(RUTA_DATA, "ModApte_test.csv"),
+]
 
 MODEL_LABELS = {
     "TF-IDF + Coseno": "buscar_coseno_tfidf",
@@ -48,6 +57,22 @@ st.markdown(
             color: #5b6573;
             margin-bottom: 1rem;
         }
+            .hit-snippet {
+                padding: 0.85rem 1rem;
+                border-left: 4px solid #ffb300;
+                background: #fff8e7;
+                border-radius: 10px;
+                white-space: pre-wrap;
+                line-height: 1.55;
+                font-size: 0.95rem;
+            }
+            .model-winner {
+                padding: 0.75rem 1rem;
+                background: #eef7ff;
+                border: 1px solid #b9dcff;
+                border-radius: 10px;
+                margin-bottom: 0.75rem;
+            }
     </style>
     """,
     unsafe_allow_html=True,
@@ -65,14 +90,65 @@ def _cargar_qrels(ruta_archivo):
         return {}
 
 
+def _obtener_estado_fuentes_corpus():
+    """Retorna metadatos simples de los archivos fuente del corpus."""
+    estado = {}
+    for ruta in ARCHIVOS_CORPUS:
+        if os.path.exists(ruta):
+            estado[ruta] = os.path.getmtime(ruta)
+        else:
+            estado[ruta] = None
+    return estado
+
+
+def _cache_corpus_vigente(meta_cache):
+    """Verifica si el cache en disco corresponde al estado actual de los CSV."""
+    if not isinstance(meta_cache, dict):
+        return False
+    return meta_cache == _obtener_estado_fuentes_corpus()
+
+
+def _guardar_cache_corpus(corpus, metadata_topics):
+    os.makedirs(os.path.dirname(RUTA_CACHE_CORPUS), exist_ok=True)
+    payload = {
+        "fuentes": _obtener_estado_fuentes_corpus(),
+        "corpus": corpus,
+        "metadata_topics": metadata_topics,
+    }
+    with open(RUTA_CACHE_CORPUS, "wb") as archivo:
+        pickle.dump(payload, archivo)
+
+
+def _cargar_cache_corpus():
+    if not os.path.exists(RUTA_CACHE_CORPUS) or os.path.getsize(RUTA_CACHE_CORPUS) == 0:
+        return None
+
+    try:
+        with open(RUTA_CACHE_CORPUS, "rb") as archivo:
+            payload = pickle.load(archivo)
+        if _cache_corpus_vigente(payload.get("fuentes")):
+            return payload.get("corpus"), payload.get("metadata_topics")
+    except Exception:
+        return None
+
+    return None
+
+
 @st.cache_resource
 def cargar_datos():
-    return cargar_corpus_completo(RUTA_DATA)
+    cache = _cargar_cache_corpus()
+    if cache:
+        corpus, metadata_topics = cache
+        return corpus, metadata_topics, "cache_disco"
+
+    corpus, metadata_topics = cargar_corpus_completo(RUTA_DATA)
+    _guardar_cache_corpus(corpus, metadata_topics)
+    return corpus, metadata_topics, "csv"
 
 
 @st.cache_resource
 def cargar_motor_clasico():
-    corpus, metadata_topics = cargar_datos()
+    corpus, metadata_topics, fuente_corpus = cargar_datos()
 
     if os.path.exists(RUTA_INDICE) and os.path.getsize(RUTA_INDICE) > 0:
         indice = IndiceInvertido.cargar_de_disco(RUTA_INDICE)
@@ -83,7 +159,7 @@ def cargar_motor_clasico():
         indice.guardar_en_disco(RUTA_INDICE)
         fuente_indice = "construido"
 
-    return MotorClasico(indice), corpus, metadata_topics, indice, fuente_indice
+    return MotorClasico(indice), corpus, metadata_topics, indice, fuente_indice, fuente_corpus
 
 
 @st.cache_resource
@@ -91,7 +167,7 @@ def cargar_motor_semantico():
     if MotorSemantico is None:
         raise RuntimeError("No se pudo importar el motor semántico.")
 
-    corpus, _ = cargar_datos()
+    corpus, _, _ = cargar_datos()
     motor_semantico = MotorSemantico()
     motor_semantico.indexar_corpus_vectorial(corpus)
     return motor_semantico
@@ -102,6 +178,86 @@ def _separar_texto(texto_articulo):
     titulo = lineas[0] if lineas and lineas[0] else "Sin título"
     cuerpo = lineas[1] if len(lineas) > 1 else ""
     return titulo, cuerpo
+
+
+def _terminos_consulta(consulta):
+    """Extrae términos de la consulta para resaltar coincidencias textuales."""
+    return [
+        termino.lower()
+        for termino in re.findall(r"[A-Za-z0-9À-ÿ]+", consulta)
+        if len(termino) > 1
+    ]
+
+
+def _resaltar_fragmento(texto, consulta, ventana=220):
+    """Devuelve un fragmento de texto con las coincidencias resaltadas."""
+    if not texto:
+        return ""
+
+    terminos = list(dict.fromkeys(_terminos_consulta(consulta)))
+    texto_lower = texto.lower()
+
+    posiciones = [texto_lower.find(termino) for termino in terminos if texto_lower.find(termino) != -1]
+    if posiciones:
+        centro = min(posiciones)
+        inicio = max(0, centro - ventana)
+        fin = min(len(texto), centro + ventana)
+        fragmento = texto[inicio:fin]
+    else:
+        fragmento = texto[: ventana * 2]
+
+    fragmento = html.escape(fragmento)
+
+    for termino in sorted(set(terminos), key=len, reverse=True):
+        patron = re.compile(rf"(?<!\w)({re.escape(termino)})(?!\w)", re.IGNORECASE)
+        fragmento = patron.sub(r"<mark>\1</mark>", fragmento)
+
+    return f'<div class="hit-snippet">{fragmento}</div>'
+
+
+def _comparar_modelos(motor_clasico, motor_semantico, consulta, top_k):
+    """Ejecuta todos los modelos disponibles y normaliza sus scores top para comparar la consulta."""
+    modelos = ["TF-IDF + Coseno", "BM25", "Jaccard"]
+    if motor_semantico is not None:
+        modelos.append("Semántico")
+
+    filas = []
+    resultados_por_modelo = {}
+
+    for modelo in modelos:
+        resultados = _buscar(motor_clasico, motor_semantico if modelo == "Semántico" else None, consulta, modelo, top_k)
+        resultados_por_modelo[modelo] = resultados
+        if resultados:
+            mejor_doc, mejor_score = resultados[0]
+            filas.append(
+                {
+                    "modelo": modelo,
+                    "doc_id_top1": str(mejor_doc),
+                    "score_top1": float(mejor_score),
+                    "docs_recuperados": len(resultados),
+                }
+            )
+        else:
+            filas.append(
+                {
+                    "modelo": modelo,
+                    "doc_id_top1": "-",
+                    "score_top1": 0.0,
+                    "docs_recuperados": 0,
+                }
+            )
+
+    df = pd.DataFrame(filas)
+    if not df.empty:
+        minimo = df["score_top1"].min()
+        maximo = df["score_top1"].max()
+        if maximo > minimo:
+            df["score_normalizado"] = (df["score_top1"] - minimo) / (maximo - minimo)
+        else:
+            df["score_normalizado"] = 1.0
+        df = df.sort_values(["score_normalizado", "score_top1"], ascending=False).reset_index(drop=True)
+
+    return df, resultados_por_modelo
 
 
 def _normalizar_relevantes(valor):
@@ -140,7 +296,7 @@ def _calcular_metricas(buscar_func, qrels, top_k):
 
 
 def _reconstruir_indice():
-    corpus, _ = cargar_datos()
+    corpus, _, _ = cargar_datos()
     indice = IndiceInvertido()
     indice.construir_indice(corpus)
     indice.guardar_en_disco(RUTA_INDICE)
@@ -165,7 +321,7 @@ st.markdown(
 )
 
 try:
-    motor_clasico, corpus_textos, metadata_topics, indice, fuente_indice = cargar_motor_clasico()
+    motor_clasico, corpus_textos, metadata_topics, indice, fuente_indice, fuente_corpus = cargar_motor_clasico()
 except Exception as error:
     st.error(f"No se pudo inicializar el backend: {error}")
     st.stop()
@@ -185,6 +341,7 @@ with st.sidebar:
         st.rerun()
 
     st.caption(f"Índice clásico: {fuente_indice}")
+    st.caption(f"Corpus cargado desde: {fuente_corpus}")
     st.caption(f"Documentos cargados: {len(corpus_textos)}")
     st.caption(f"Términos únicos: {len(indice.indice)}")
 
@@ -206,17 +363,31 @@ if seccion == "Buscar":
         )
 
     top_k = st.slider("Top K", min_value=1, max_value=20, value=5)
+    comparar_modelos = st.checkbox("Comparar todos los modelos para esta consulta", value=True)
 
     ejecutar = st.button("Buscar", type="primary")
 
     if ejecutar and consulta.strip():
         with st.spinner("Procesando consulta..."):
             try:
-                motor_semantico = cargar_motor_semantico() if modelo == "Semántico" else None
+                motor_semantico = None
+                if modelo == "Semántico" or comparar_modelos:
+                    try:
+                        motor_semantico = cargar_motor_semantico()
+                    except Exception as error_semantico:
+                        if modelo == "Semántico":
+                            raise
+                        st.warning(f"No se pudo cargar el motor semántico para la comparación: {error_semantico}")
                 resultados = _buscar(motor_clasico, motor_semantico, consulta, modelo, top_k)
+                comparacion_df = None
+                resultados_comparados = None
+                if comparar_modelos:
+                    comparacion_df, resultados_comparados = _comparar_modelos(motor_clasico, motor_semantico, consulta, top_k)
             except Exception as error:
                 st.error(f"La búsqueda falló: {error}")
                 resultados = []
+                comparacion_df = None
+                resultados_comparados = None
 
         if resultados:
             st.success(f"Se encontraron {len(resultados)} resultados.")
@@ -236,7 +407,7 @@ if seccion == "Buscar":
                     st.markdown(f"**Título:** {titulo}")
                     st.markdown(f"**Documento ID:** {doc_id}")
                     if cuerpo:
-                        st.code(cuerpo, language="text")
+                        st.markdown(_resaltar_fragmento(cuerpo, consulta), unsafe_allow_html=True)
                     else:
                         st.info("El documento no tiene cuerpo separado.")
 
@@ -257,6 +428,48 @@ if seccion == "Buscar":
                 use_container_width=True,
                 hide_index=True,
             )
+
+            if comparar_modelos and comparacion_df is not None and not comparacion_df.empty:
+                st.markdown("### Comparación de modelos para la misma consulta")
+                mejor_fila = comparacion_df.iloc[0]
+                st.markdown(
+                    f'<div class="model-winner"><strong>Mejor modelo para esta consulta:</strong> {mejor_fila["modelo"]} '
+                    f'| Documento top1: {mejor_fila["doc_id_top1"]} '
+                    f'| Score normalizado: {mejor_fila["score_normalizado"]:.4f}</div>',
+                    unsafe_allow_html=True,
+                )
+                st.dataframe(
+                    comparacion_df[["modelo", "doc_id_top1", "score_top1", "score_normalizado", "docs_recuperados"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                grafico_comp_col1, grafico_comp_col2 = st.columns(2)
+                with grafico_comp_col1:
+                    st.caption("Score top1 normalizado por modelo")
+                    st.bar_chart(comparacion_df.set_index("modelo")["score_normalizado"])
+                with grafico_comp_col2:
+                    st.caption("Score top1 crudo por modelo")
+                    st.bar_chart(comparacion_df.set_index("modelo")["score_top1"])
+
+                if resultados_comparados:
+                    with st.expander("Ver resultados de cada modelo"):
+                        for nombre_modelo, lista_resultados in resultados_comparados.items():
+                            if not lista_resultados:
+                                st.write(f"**{nombre_modelo}**: sin resultados")
+                                continue
+                            st.write(f"**{nombre_modelo}**")
+                            mini_df = pd.DataFrame(
+                                [
+                                    {
+                                        "rank": idx + 1,
+                                        "doc_id": str(doc_id),
+                                        "score": float(score),
+                                    }
+                                    for idx, (doc_id, score) in enumerate(lista_resultados)
+                                ]
+                            )
+                            st.dataframe(mini_df, use_container_width=True, hide_index=True)
         else:
             st.warning("No se encontraron documentos relevantes.")
 
