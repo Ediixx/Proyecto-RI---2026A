@@ -2,12 +2,25 @@
 import re
 import nltk
 from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
+from nltk.tokenize import word_tokenize, wordpunct_tokenize
 from nltk.stem import PorterStemmer
 
 # Asegurar las descargas de NLTK
 nltk.download('punkt', quiet=True)
+nltk.download('punkt_tab', quiet=True)
 nltk.download('stopwords', quiet=True)
+
+
+def _tokenizar(texto):
+    """Tokeniza con punkt y cae a una tokenización simple si falta punkt_tab."""
+    try:
+        return word_tokenize(texto)
+    except LookupError:
+        try:
+            nltk.download('punkt_tab', quiet=True)
+            return word_tokenize(texto)
+        except LookupError:
+            return wordpunct_tokenize(texto)
 
 def limpiar_texto(texto):
     """
@@ -24,7 +37,7 @@ def limpiar_texto(texto):
     texto = re.sub(r'[^a-zA-Z\s]', '', texto)
     
     # 4. Tokenización
-    tokens = word_tokenize(texto)
+    tokens = _tokenizar(texto)
     
     # 5. Filtrado de Stopwords en inglés
     stop_words = set(stopwords.words('english'))
