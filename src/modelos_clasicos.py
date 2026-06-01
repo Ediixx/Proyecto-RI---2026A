@@ -15,6 +15,56 @@ class MotorClasico:
         
         # Calcular el promedio de longitud de documentos (necesario para BM25)
         self.avgdl = sum(self.doc_lengths.values()) / self.N if self.N > 0 else 0
+        
+        # Cache para normalización de BM25
+        self._cache_bm25_max = {}
+    
+    def _normalizar_scores(self, scores_dict, metodo="minmax"):
+        """
+        Normaliza scores a rango [0, 1] para comparación justa entre modelos.
+        
+        Args:
+            scores_dict: dict {doc_id: score}
+            metodo: "minmax" (recomendado) o "softmax"
+        
+        Returns:
+            lista [(doc_id, score_norm)] ordenada descendente
+        """
+        if not scores_dict:
+            return []
+        
+        scores_list = list(scores_dict.items())
+        valores = [v for _, v in scores_list]
+        
+        if metodo == "minmax":
+            # Normalización Min-Max: (x - min) / (max - min)
+            minimo = min(valores)
+            maximo = max(valores)
+            
+            if minimo == maximo:
+                # Todos los scores iguales
+                scores_norm = [(doc_id, 1.0) for doc_id, _ in scores_list]
+            else:
+                scores_norm = [
+                    (doc_id, (score - minimo) / (maximo - minimo))
+                    for doc_id, score in scores_list
+                ]
+        
+        elif metodo == "softmax":
+            # Normalización Softmax
+            max_score = max(valores)
+            exp_scores = [math.exp(score - max_score) for score in valores]
+            sum_exp = sum(exp_scores)
+            scores_norm = [
+                (doc_id, exp_score / sum_exp)
+                for (doc_id, _), exp_score in zip(scores_list, exp_scores)
+            ]
+        
+        else:
+            raise ValueError(f"Método desconocido: {metodo}")
+        
+        # Ordenar descendente por score normalizado
+        return sorted(scores_norm, key=lambda x: x[1], reverse=True)
 
     # ---------------------------------------------------------
     # MODELO 1: SIMILITUD DE JACCARD (Vectores Binarios)
@@ -125,3 +175,42 @@ class MotorClasico:
 
         ranking_ordenado = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return ranking_ordenado[:top_k]
+
+    # ---------------------------------------------------------
+    # VERSIONES NORMALIZADAS (scores en [0, 1] para comparación justa)
+    # ---------------------------------------------------------
+    
+    def buscar_jaccard_norm(self, consulta, top_k=10):
+        """Jaccard con scores normalizados a [0, 1] (ya está normalizado)."""
+        return self.buscar_jaccard(consulta, top_k)
+    
+    def buscar_coseno_tfidf_norm(self, consulta, top_k=10):
+        """TF-IDF con scores normalizados a [0, 1] (ya está normalizado)."""
+        return self.buscar_coseno_tfidf(consulta, top_k)
+    
+    def buscar_bm25_norm(self, consulta, k1=1.5, b=0.75, top_k=10):
+        """
+        BM25 con scores normalizados a [0, 1] usando Min-Max.
+        
+        BM25 retorna scores sin límite superior. Esta versión normaliza 
+        los scores para comparación justa con otros modelos.
+        """
+        tokens_q = limpiar_texto(consulta)
+        if not tokens_q:
+            return []
+
+        scores = collections.defaultdict(float)
+        
+        for termino in set(tokens_q):
+            if termino in self.indice:
+                df = len(self.indice[termino])
+                idf = math.log((self.N - df + 0.5) / (df + 0.5) + 1.0)
+                
+                for doc_id, tf in self.indice[termino].items():
+                    doc_len = self.doc_lengths.get(doc_id, self.avgdl)
+                    numerador = tf * (k1 + 1)
+                    denominador = tf + k1 * (1 - b + b * (doc_len / self.avgdl))
+                    scores[doc_id] += idf * (numerador / denominador)
+
+        # ✅ Normalizar a [0, 1]
+        return self._normalizar_scores(scores, metodo="minmax")[:top_k]

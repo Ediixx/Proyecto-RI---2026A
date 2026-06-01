@@ -10,6 +10,7 @@ import streamlit as st
 from src.dataloader import cargar_corpus_completo
 from src.indexacion import IndiceInvertido
 from src.modelos_clasicos import MotorClasico
+from src.evaluacion import evaluar_modelo, comparar_modelos, generar_reporte_comparativo
 
 try:
     from src.semantica import MotorSemantico
@@ -33,6 +34,75 @@ MODEL_LABELS = {
     "Jaccard": "buscar_jaccard",
 }
 
+# Versiones normalizadas para evaluación comparativa
+MODEL_LABELS_NORM = {
+    "TF-IDF + Coseno": "buscar_coseno_tfidf_norm",
+    "BM25": "buscar_bm25_norm",
+    "Jaccard": "buscar_jaccard_norm",
+}
+
+
+def _version_cache_evaluacion():
+    """Genera una versión simple para invalidar la caché cuando cambian los datos base."""
+    partes = []
+    for ruta in [RUTA_INDICE, RUTA_QRELS, *ARCHIVOS_CORPUS]:
+        if os.path.exists(ruta):
+            partes.append(str(os.path.getmtime(ruta)))
+        else:
+            partes.append("none")
+    return "|".join(partes)
+
+
+def _serializar_qrels_normalizados(qrels_normalizado):
+    """Convierte los qrels normalizados a una cadena estable para cache."""
+    qrels_ordenado = {
+        str(consulta): sorted(str(doc_id) for doc_id in relevancia)
+        for consulta, relevancia in sorted(qrels_normalizado.items(), key=lambda item: str(item[0]))
+    }
+    return json.dumps(qrels_ordenado, ensure_ascii=False, sort_keys=True)
+
+
+def _deserializar_qrels_normalizados(qrels_serializados):
+    """Reconstruye los qrels normalizados desde su representación serializada."""
+    qrels = json.loads(qrels_serializados)
+    return {consulta: set(doc_ids) for consulta, doc_ids in qrels.items()}
+
+
+@st.cache_data(show_spinner=False)
+def _evaluar_modelo_cacheado(modelo, qrels_serializados, top_k, version_cache):
+    """Evalúa un modelo concreto reutilizando resultados cacheados cuando es posible."""
+    del version_cache
+    qrels_normalizado = _deserializar_qrels_normalizados(qrels_serializados)
+    motor_clasico, _, _, _, _, _ = cargar_motor_clasico()
+
+    if modelo == "Semántico":
+        motor_semantico = cargar_motor_semantico()
+        buscar_func = lambda q, top_k=top_k: motor_semantico.buscar_semantica(q, top_k)
+    else:
+        metodo_norm = MODEL_LABELS_NORM[modelo]
+        buscar_func = lambda q, top_k=top_k, mt=metodo_norm: getattr(motor_clasico, mt)(q, top_k)
+
+    return evaluar_modelo(buscar_func, qrels_normalizado, top_k=top_k)
+
+
+@st.cache_data(show_spinner=False)
+def _comparar_modelos_cacheado(qrels_serializados, top_k, version_cache):
+    """Compara todos los modelos disponibles reutilizando resultados cacheados cuando es posible."""
+    del version_cache
+    qrels_normalizado = _deserializar_qrels_normalizados(qrels_serializados)
+    motor_clasico, _, _, _, _, _ = cargar_motor_clasico()
+
+    modelos_a_evaluar = {}
+    for nombre in ["TF-IDF + Coseno", "BM25", "Jaccard"]:
+        metodo_norm = MODEL_LABELS_NORM[nombre]
+        modelos_a_evaluar[nombre] = lambda q, top_k=top_k, mt=metodo_norm: getattr(motor_clasico, mt)(q, top_k)
+
+    if MotorSemantico is not None:
+        motor_semantico = cargar_motor_semantico()
+        modelos_a_evaluar["Semántico"] = lambda q, top_k=top_k: motor_semantico.buscar_semantica(q, top_k)
+
+    return comparar_modelos(modelos_a_evaluar, qrels_normalizado, top_k=top_k)
+
 
 st.set_page_config(
     page_title="Motor de Búsqueda Reuters-21578",
@@ -44,13 +114,14 @@ st.markdown(
     """
     <style>
         .block-container {
-            padding-top: 1.5rem;
+            padding-top: 4rem;
             padding-bottom: 2rem;
         }
         .app-title {
             font-size: 2.4rem;
             font-weight: 800;
             margin-bottom: 0.25rem;
+            margin-top: 1rem;
         }
         .app-subtitle {
             font-size: 1.05rem;
@@ -269,30 +340,17 @@ def _normalizar_relevantes(valor):
 
 
 def _calcular_metricas(buscar_func, qrels, top_k):
-    metricas = []
+    """
+    Versión heredada para compatibilidad. Usa evaluacion.evaluar_modelo.
+    """
+    qrels_normalizado = {}
     for consulta, relevancia in qrels.items():
         relevantes = _normalizar_relevantes(relevancia)
-        if not relevantes:
-            continue
-
-        resultados = buscar_func(str(consulta), top_k=top_k)
-        recuperados = [str(doc_id) for doc_id, _ in resultados]
-
-        tp = len(set(recuperados) & relevantes)
-        precision = tp / len(recuperados) if recuperados else 0.0
-        recall = tp / len(relevantes) if relevantes else 0.0
-        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-
-        metricas.append(
-            {
-                "query": str(consulta)[:40],
-                "precision": precision,
-                "recall": recall,
-                "f1": f1,
-            }
-        )
-
-    return metricas
+        if relevantes:
+            qrels_normalizado[consulta] = relevantes
+    
+    resultado = evaluar_modelo(buscar_func, qrels_normalizado, top_k=top_k)
+    return resultado['por_consulta']
 
 
 def _reconstruir_indice():
@@ -546,27 +604,191 @@ elif seccion == "Evaluación":
     if not qrels:
         st.warning("No hay qrels cargados. `data/qrels.json` está vacío o no contiene datos.")
     else:
-        modelo_eval = st.selectbox("Modelo para evaluar", ["TF-IDF + Coseno", "BM25", "Jaccard"])
+        opciones_modelos = ["TF-IDF + Coseno", "BM25", "Jaccard"]
+        if MotorSemantico is not None:
+            opciones_modelos.append("Semántico")
+        
+        modelo_eval = st.selectbox("Modelo para evaluar", opciones_modelos)
         top_k_eval = st.slider("Top K de evaluación", min_value=1, max_value=20, value=5, key="top_k_eval")
+        
+        comparar_todos = st.checkbox("Comparar todos los modelos", value=False)
 
         if st.button("Ejecutar evaluación"):
             with st.spinner("Calculando métricas..."):
-                metricas = _calcular_metricas(
-                    lambda consulta, top_k=top_k_eval: _buscar(motor_clasico, None, consulta, modelo_eval, top_k),
-                    qrels,
-                    top_k_eval,
-                )
+                # Normalizar qrels
+                qrels_normalizado = {}
+                for consulta, relevancia in qrels.items():
+                    relevantes = _normalizar_relevantes(relevancia)
+                    if relevantes:
+                        qrels_normalizado[consulta] = relevantes
 
-            if not metricas:
-                st.warning("No fue posible calcular métricas con los qrels cargados.")
-            else:
-                st.dataframe(metricas, use_container_width=True)
+                qrels_serializados = _serializar_qrels_normalizados(qrels_normalizado)
+                version_cache = _version_cache_evaluacion()
+                
+                if comparar_todos:
+                    cache_key = f"eval_comparacion::{top_k_eval}::{version_cache}::{qrels_serializados}"
+                    if cache_key in st.session_state:
+                        resultados_comparacion = st.session_state[cache_key]
+                        st.info("Resultados cargados desde caché de la sesión.")
+                    else:
+                        # Comparar todos los modelos disponibles
+                        modelos_a_evaluar = {}
 
-                precision_media = sum(item["precision"] for item in metricas) / len(metricas)
-                recall_media = sum(item["recall"] for item in metricas) / len(metricas)
-                f1_media = sum(item["f1"] for item in metricas) / len(metricas)
+                        # Modelos clásicos con versiones NORMALIZADAS para comparación justa
+                        for nombre in ["TF-IDF + Coseno", "BM25", "Jaccard"]:
+                            metodo_norm = MODEL_LABELS_NORM[nombre]
+                            buscar_func = lambda q, top_k=top_k_eval, mt=metodo_norm: getattr(
+                                motor_clasico, mt
+                            )(q, top_k)
+                            modelos_a_evaluar[nombre] = buscar_func
 
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Precision media", f"{precision_media:.4f}")
-                m2.metric("Recall medio", f"{recall_media:.4f}")
-                m3.metric("F1 medio", f"{f1_media:.4f}")
+                        # Modelo semántico (ya retorna scores normalizados)
+                        if MotorSemantico is not None:
+                            try:
+                                motor_semantico = cargar_motor_semantico()
+                                buscar_semantico = lambda q, top_k=top_k_eval: motor_semantico.buscar_semantica(q, top_k)
+                                modelos_a_evaluar["Semántico"] = buscar_semantico
+                            except Exception as e:
+                                st.warning(f"No se pudo cargar modelo semántico: {e}")
+
+                        # Evaluar todos los modelos
+                        progress_bar_comp = st.progress(0, text="Inicializando comparación...")
+
+                        def actualizar_progreso_comp(actual, total, mensaje):
+                            progreso = actual / total if total > 0 else 0
+                            progress_bar_comp.progress(progreso, text=mensaje)
+
+                        resultados_comparacion = comparar_modelos(
+                            modelos_a_evaluar,
+                            qrels_normalizado,
+                            top_k=top_k_eval,
+                            progress_callback=actualizar_progreso_comp
+                        )
+                        progress_bar_comp.empty()  # Limpiar barra al terminar
+                        st.session_state[cache_key] = resultados_comparacion
+                    
+                    # Mostrar resultados tabulares
+                    st.markdown("### Comparación de Modelos")
+                    
+                    # Crear tabla comparativa
+                    filas_comparacion = []
+                    for modelo, resultado in resultados_comparacion.items():
+                        if resultado is None:
+                            filas_comparacion.append({
+                                'Modelo': modelo,
+                                'Precision': 'N/D',
+                                'Recall': 'N/D',
+                                'F1': 'N/D',
+                                'MAP': 'N/D',
+                                'Consultas': 0,
+                                'Estado': 'No disponible o con error'
+                            })
+                            continue
+
+                        agg = resultado['agregadas']
+                        filas_comparacion.append({
+                            'Modelo': modelo,
+                            'Precision': f"{agg['precision_media']:.4f}",
+                            'Recall': f"{agg['recall_media']:.4f}",
+                            'F1': f"{agg['f1_media']:.4f}",
+                            'MAP': f"{agg['map']:.4f}",
+                            'Consultas': agg['num_consultas'],
+                            'Estado': 'OK'
+                        })
+                    
+                    df_comparacion = pd.DataFrame(filas_comparacion)
+                    st.dataframe(df_comparacion, use_container_width=True, hide_index=True)
+                    
+                    # Gráficos comparativos
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        datos_map = []
+                        for modelo, resultado in resultados_comparacion.items():
+                            if resultado:
+                                datos_map.append({
+                                    'Modelo': modelo,
+                                    'MAP': resultado['agregadas']['map']
+                                })
+                        if datos_map:
+                            df_map = pd.DataFrame(datos_map).set_index('Modelo')
+                            st.bar_chart(df_map)
+                            st.caption("MAP por modelo")
+                    
+                    with col2:
+                        datos_f1 = []
+                        for modelo, resultado in resultados_comparacion.items():
+                            if resultado:
+                                datos_f1.append({
+                                    'Modelo': modelo,
+                                    'F1': resultado['agregadas']['f1_media']
+                                })
+                        if datos_f1:
+                            df_f1 = pd.DataFrame(datos_f1).set_index('Modelo')
+                            st.bar_chart(df_f1)
+                            st.caption("F1 Promedio por modelo")
+                    
+                    # Detalles por consulta para modelo seleccionado
+                    if modelo_eval in resultados_comparacion and resultados_comparacion[modelo_eval]:
+                        with st.expander(f"📊 Detalle por consulta - {modelo_eval}"):
+                            df_detalle = pd.DataFrame(resultados_comparacion[modelo_eval]['por_consulta'])
+                            st.dataframe(df_detalle, use_container_width=True, hide_index=True)
+                    elif comparar_todos:
+                        st.info("Algún modelo no devolvió resultados. Revisa la columna 'Estado' en la tabla de comparación.")
+                
+                else:
+                    # Evaluar un solo modelo con versión NORMALIZADA para comparación justa
+                    if modelo_eval == "Semántico":
+                        try:
+                            motor_semantico = cargar_motor_semantico()
+                            buscar_func = lambda q, top_k=top_k_eval: motor_semantico.buscar_semantica(q, top_k)
+                        except Exception as e:
+                            st.error(f"No se pudo cargar modelo semántico: {e}")
+                            st.stop()
+                    else:
+                        # Usar versión normalizada para modelos clásicos
+                        metodo_norm = MODEL_LABELS_NORM[modelo_eval]
+                        buscar_func = lambda q, top_k=top_k_eval, mt=metodo_norm: getattr(
+                            motor_clasico, mt
+                        )(q, top_k)
+
+                    cache_key = f"eval_modelo::{modelo_eval}::{top_k_eval}::{version_cache}::{qrels_serializados}"
+                    if cache_key in st.session_state:
+                        resultado = st.session_state[cache_key]
+                        st.info("Resultados cargados desde caché de la sesión.")
+                    else:
+                        # Crear barra de progreso
+                        progress_bar = st.progress(0, text="Iniciando evaluación...")
+
+                        def actualizar_progreso(actual, total, mensaje):
+                            progreso = actual / total
+                            progress_bar.progress(progreso, text=mensaje)
+
+                        resultado = evaluar_modelo(
+                            buscar_func,
+                            qrels_normalizado,
+                            top_k=top_k_eval,
+                            progress_callback=actualizar_progreso
+                        )
+                        progress_bar.empty()  # Limpiar barra al terminar
+                        st.session_state[cache_key] = resultado
+                    
+                    metricas = resultado['por_consulta']
+                    agg = resultado['agregadas']
+                    
+                    if not metricas:
+                        st.warning("No fue posible calcular métricas con los qrels cargados.")
+                    else:
+                        st.markdown(f"### Evaluación: {modelo_eval} (scores normalizados)")
+                        
+                        # Tabla de métricas por consulta
+                        df_metricas = pd.DataFrame(metricas)
+                        st.dataframe(df_metricas, use_container_width=True, hide_index=True)
+                        
+                        # Métricas agregadas
+                        st.markdown("### Métricas Agregadas")
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Precision media", f"{agg['precision_media']:.4f}")
+                        m2.metric("Recall medio", f"{agg['recall_media']:.4f}")
+                        m3.metric("F1 medio", f"{agg['f1_media']:.4f}")
+                        m4.metric("MAP", f"{agg['map']:.4f}")
