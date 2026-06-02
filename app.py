@@ -114,12 +114,13 @@ st.markdown(
     """
     <style>
         .block-container {
-            padding-top: 4rem;
+            padding-top: 1.5rem;
             padding-bottom: 2rem;
         }
         .app-title {
             font-size: 2.4rem;
             font-weight: 800;
+            margin-top: 0.8rem;
             margin-bottom: 0.25rem;
             margin-top: 1rem;
         }
